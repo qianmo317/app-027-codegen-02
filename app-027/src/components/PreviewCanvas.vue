@@ -7,6 +7,7 @@ import type { CutStep } from '@/logic/order'
 import { closestOnPolyline, boundsOf, mergeBounds } from '@/logic/geometry'
 import type { SheetPlacement } from '@/logic/exporters'
 import { placePoint } from '@/logic/exporters'
+import type { ContourRisk } from '@/logic/dropRisk'
 
 type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'rect' | 'circle' | 'polygon' | 'bridge' | 'pan'
@@ -28,6 +29,8 @@ const props = withDefaults(
     simIndex?: number
     placement?: SheetPlacement | null
     statusText?: string
+    /** 掉落风险试算结果：存在时轮廓按危险档着色 */
+    riskItems?: ContourRisk[] | null
   }>(),
   {
     job: null,
@@ -43,6 +46,7 @@ const props = withDefaults(
     simIndex: -1,
     placement: null,
     statusText: '',
+    riskItems: null,
   },
 )
 
@@ -310,21 +314,58 @@ function pointsToD(pts: Pt[], closed: boolean): string {
 
 const outlineContours = computed<DrawContour[]>(() => {
   const out: DrawContour[] = []
+  const riskOf = new Map((props.riskItems ?? []).map((r) => [r.contourId, r]))
   for (const s of props.shapes) {
     for (const c of s.contours) {
       const bad = c.warnings.find((w) => w === 'self_intersect' || w === 'not_closed' || w === 'duplicate')
+      const risk = riskOf.get(c.id)
+      // 有硬伤（未闭合/自交/重复）仍以告警色优先；闭合轮廓按风险档着色
+      const riskColor = !bad && c.closed && risk && props.mode !== 'toolpath' ? risk.level.color : null
       out.push({
         id: c.id,
         shapeId: s.id,
         d: pointsToD(c.points, c.closed),
         contour: c,
-        color: bad ? WARNING_COLOR[bad] : props.mode === 'bridge' ? '#4a5768' : '#cfd9e4',
+        color: bad ? WARNING_COLOR[bad] : riskColor ?? (props.mode === 'bridge' ? '#4a5768' : '#cfd9e4'),
         dash: bad === 'duplicate' ? '5 4' : bad === 'not_closed' ? '7 4' : '',
         width: c.id === props.selectedContourId ? 2.4 : 1.2,
       })
     }
   }
   return out
+})
+
+function hexA(hex: string, alpha: number): string {
+  const h = hex.replace('#', '')
+  const r = parseInt(h.slice(0, 2), 16)
+  const g = parseInt(h.slice(2, 4), 16)
+  const b = parseInt(h.slice(4, 6), 16)
+  return `rgba(${r},${g},${b},${alpha})`
+}
+
+/** 风险档半透明填充：只给中/高/危险档，档位越高越醒目 */
+const riskFills = computed(() => {
+  if (!props.riskItems || props.mode === 'toolpath') return []
+  const riskOf = new Map(props.riskItems.map((r) => [r.contourId, r]))
+  const out: Array<{ id: string; d: string; fill: string }> = []
+  for (const s of props.shapes) {
+    for (const c of s.contours) {
+      if (!c.closed || c.warnings.some((w) => w === 'not_closed' || w === 'self_intersect')) continue
+      const r = riskOf.get(c.id)
+      if (!r || r.level.level === 'low') continue
+      const alpha = r.level.level === 'critical' ? 0.22 : r.level.level === 'high' ? 0.15 : 0.08
+      out.push({ id: c.id, d: pointsToD(c.points, true), fill: hexA(r.level.color, alpha) })
+    }
+  }
+  return out
+})
+
+/** 高/危险档在轮廓质心处显示评分徽标 */
+const riskBadges = computed(() => {
+  if (!props.riskItems || props.mode === 'toolpath') return []
+  return props.riskItems
+    .filter((r) => r.level.level === 'high' || r.level.level === 'critical')
+    .map((r) => ({ id: r.contourId, x: r.anchor.x, y: r.anchor.y, score: r.level.score, color: r.level.color }))
 })
 
 const pl = (p: Pt): Pt => (props.placement ? placePoint(p, props.placement) : p)
@@ -521,6 +562,11 @@ function focusContour(id: string): void {
           vector-effect="non-scaling-stroke"
         />
 
+        <!-- 风险档半透明填充 -->
+        <g v-if="riskFills.length">
+          <path v-for="f in riskFills" :key="`rf${f.id}`" :d="f.d" :fill="f.fill" stroke="none" />
+        </g>
+
         <!-- 成品轮廓 -->
         <g v-if="mode === 'outline' || mode === 'bridge' || !job" fill="none" stroke-linecap="round" stroke-linejoin="round">
           <path
@@ -532,6 +578,24 @@ function focusContour(id: string): void {
             :stroke-width="c.width"
             vector-effect="non-scaling-stroke"
           />
+        </g>
+
+        <!-- 风险评分徽标 -->
+        <g v-if="riskBadges.length">
+          <g v-for="b in riskBadges" :key="`rb${b.id}`">
+            <circle :cx="b.x" :cy="b.y" :r="3.4 / zoom" :fill="b.color" stroke="#12161b" :stroke-width="0.8 / zoom" />
+            <text
+              :x="b.x"
+              :y="b.y + 1.5 / zoom"
+              :font-size="4.2 / zoom"
+              text-anchor="middle"
+              fill="#12161b"
+              font-weight="700"
+              font-family="Plotter Mono, monospace"
+            >
+              {{ b.score }}
+            </text>
+          </g>
         </g>
 
         <!-- 刀路（切割顺序） -->

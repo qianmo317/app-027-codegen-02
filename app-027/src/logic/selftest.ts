@@ -7,6 +7,7 @@ import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import { assessProject, plansForHypothetical, RISK_MODEL, type RiskInput } from './dropRisk'
 
 export type CheckResult = {
   id: string
@@ -450,6 +451,130 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
       '刀补超出轮廓尺度时明确警告并保留原路径（不输出坏路径）',
       !tinyOk && tinyMsg.includes('原路径') && tinyRuns > 0,
       `0.3mm 细长条（内层，向内侧偏置 ${mat.bladeOffsetMm}mm）：${tinyMsg}｜仍输出 ${tinyRuns} 段原路径`,
+    ),
+  )
+
+  // ---------- 10. 掉落风险试算 ----------
+  // 造一组可控轮廓：外框 + 内部小碎片（窄缺口高风险）+ 内部大片（宽缺口低风险）
+  const riskOuter = rectContour('rk_outer', 0, 0, 60, 60)
+  const riskTiny = rectContour('rk_tiny', 20, 20, 1.2, 1.0) // 1.2mm² 碎片，细短
+  const riskBig = rectContour('rk_big', 30, 30, 14, 14) // 196mm² 内片
+  const riskShape: Shape = { id: 'st_risk', name: '风险试算用例', layer: 0, contours: [riskOuter, riskTiny, riskBig] }
+  const riskInput: RiskInput = {
+    areaThresholdMm2: settings.areaThresholdMm2,
+    bridgeWidthMm: settings.bridgeWidthMm,
+    bridgeEveryMm: settings.bridgeEveryMm,
+    bridgeRule: 'by_area',
+    material: mat,
+  }
+  const riskCompNarrow = computeShape(riskShape, { ...settings, bridgeWidthMm: 0.2 }, mat)
+  const riskReportNarrow = assessProject([riskShape], new Map([[riskShape.id, riskCompNarrow]]), { ...riskInput, bridgeWidthMm: 0.2 })
+  const tinyRisk = riskReportNarrow.items.find((i) => i.contourId === 'rk_tiny')
+  const bigRisk = riskReportNarrow.items.find((i) => i.contourId === 'rk_big')
+  const outerRisk = riskReportNarrow.items.find((i) => i.contourId === 'rk_outer')
+  const riskTierOk =
+    !!tinyRisk &&
+    ['high', 'critical'].includes(tinyRisk.level.level) &&
+    !!bigRisk &&
+    ['low', 'medium'].includes(bigRisk.level.level) &&
+    !!outerRisk &&
+    outerRisk.level.level === 'low'
+  const riskSuggestOk =
+    !!tinyRisk &&
+    tinyRisk.suggestion.widthLo >= RISK_MODEL.reliableW - 1e-9 &&
+    tinyRisk.suggestion.count >= 2 &&
+    tinyRisk.suggestion.strategy !== 'none'
+  checks.push(
+    ok(
+      'drop-risk-tier',
+      '掉落风险试算：小碎片判高/危险档、大片与外轮廓判低档（按面积/细长/层/缺口综合评分）',
+      riskTierOk,
+      tinyRisk && bigRisk && outerRisk
+        ? `1.2mm² 碎片评分 ${tinyRisk.level.score}（${tinyRisk.level.label}）｜196mm² 内片 ${bigRisk.level.score}（${bigRisk.level.label}）｜外框 ${outerRisk.level.score}（${outerRisk.level.label}）`
+        : '试算结果缺失',
+    ),
+  )
+  checks.push(
+    ok(
+      'drop-risk-suggest',
+      '高风险片给出建议缺口宽度区间（≥0.45mm）与个数（≥2），并给出加宽/并入建议',
+      riskSuggestOk,
+      tinyRisk
+        ? `建议 ${tinyRisk.suggestion.widthLo}~${tinyRisk.suggestion.widthHi}mm × ${tinyRisk.suggestion.count}｜${tinyRisk.suggestion.strategyText}（${tinyRisk.suggestion.reason.slice(0, 48)}…）`
+        : '未生成建议',
+    ),
+  )
+
+  // 极小 + 极细长的片（0.36mm²、细长比 ~10）→ 应建议并入相邻父轮廓
+  const riskHair = rectContour('rk_hair', 20, 20, 1.2, 0.3) // 0.36mm²
+  const mergeShape: Shape = { id: 'st_risk_merge', name: '并入建议用例', layer: 0, contours: [riskOuter, riskHair] }
+  const mergeComp = computeShape(mergeShape, { ...settings, bridgeWidthMm: 0.2 }, mat)
+  const mergeReport = assessProject([mergeShape], new Map([[mergeShape.id, mergeComp]]), { ...riskInput, bridgeWidthMm: 0.2 })
+  const hairRisk = mergeReport.items.find((i) => i.contourId === 'rk_hair')
+  const mergeOk = !!hairRisk && hairRisk.suggestion.strategy === 'merge' && hairRisk.suggestion.mergeParentId === 'rk_outer'
+  checks.push(
+    ok(
+      'drop-risk-merge',
+      '极小细长片放不下可靠缺口时，建议「并入相邻轮廓」并指明父轮廓（而不是一味加宽）',
+      mergeOk,
+      hairRisk
+        ? `0.36mm² 细片评分 ${hairRisk.level.score}：${hairRisk.suggestion.strategyText}，父轮廓 = ${hairRisk.suggestion.mergeParentId ?? '无'}｜${hairRisk.suggestion.reason.slice(0, 60)}…`
+        : '未生成建议',
+    ),
+  )
+
+  // 加宽缺口后风险应显著下降（即时重算 / 两版对照的依据）
+  const riskCompWide = computeShape(riskShape, { ...settings, bridgeWidthMm: 0.9 }, mat)
+  const riskReportWide = assessProject([riskShape], new Map([[riskShape.id, riskCompWide]]), { ...riskInput, bridgeWidthMm: 0.9 })
+  const tinyWide = riskReportWide.items.find((i) => i.contourId === 'rk_tiny')
+  const riskRecomputeOk = !!tinyRisk && !!tinyWide && tinyWide.level.score < tinyRisk.level.score
+  // 假设参数重算（不修改项目设置）也必须得到与直接设置一致的结论 → 两版对照可行
+  const hypothetical = assessProject(
+    [riskShape],
+    new Map([[riskShape.id, riskCompNarrow]]),
+    { ...riskInput, bridgeWidthMm: 0.9 },
+    plansForHypothetical([riskShape], { ...riskInput, bridgeWidthMm: 0.9 }),
+  )
+  const tinyHypo = hypothetical.items.find((i) => i.contourId === 'rk_tiny')
+  const hypoOk = !!tinyHypo && Math.abs(tinyHypo.level.score - (tinyWide?.level.score ?? NaN)) <= 2
+
+  checks.push(
+    ok(
+      'drop-risk-recompute',
+      '改缺口宽度后立即重算、风险下降；假设参数版结论与实参版一致（支持两版对照）',
+      riskRecomputeOk && hypoOk,
+      `碎片评分：窄缺口 0.2mm = ${tinyRisk?.level.score} → 宽缺口 0.9mm = ${tinyWide?.level.score}｜假设版 ${tinyHypo?.level.score}（一致 = ${hypoOk}）｜预计掉片 ${riskReportNarrow.dropCount} → ${riskReportWide.dropCount}`,
+    ),
+  )
+
+  // 面积阈值上调后更多片进入碎片强制连刀 → 无缺口必掉的片减少；层级归属改变也重算
+  const riskReportThr = assessProject(
+    [riskShape],
+    new Map([[riskShape.id, computeShape(riskShape, { ...settings, areaThresholdMm2: 250 }, mat)]]),
+    { ...riskInput, areaThresholdMm2: 250 },
+  )
+  const bigForced = riskReportThr.items.find((i) => i.contourId === 'rk_big')
+  const thresholdOk = !!bigForced && bigForced.gapCount >= 2
+  checks.push(
+    ok(
+      'drop-risk-threshold',
+      '面积阈值/层级归属改变后重算：阈值上调到 250mm²，196mm² 内片也被强制连刀',
+      thresholdOk,
+      bigForced ? `196mm² 内片缺口数 ${bigForced.gapCount}（阈值 250mm² 下按碎片强制 2 个）｜评分 ${bigForced.level.score}` : '未重算',
+    ),
+  )
+
+  // 总体结论：窄缺口版必须给出「会掉几片 + 最危险片」
+  const summaryOk =
+    riskReportNarrow.dropCount >= 1 &&
+    riskReportNarrow.worst?.contourId === 'rk_tiny' &&
+    riskReportNarrow.summary.includes('会掉')
+  checks.push(
+    ok(
+      'drop-risk-summary',
+      '整张纹样总体结论：给出预计掉片数与最危险的一片',
+      summaryOk,
+      riskReportNarrow.summary,
     ),
   )
 

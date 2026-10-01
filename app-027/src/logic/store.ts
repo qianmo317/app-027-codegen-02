@@ -370,6 +370,33 @@ export function clearManualBridges(p: Project, contourId?: string): void {
   touch(p)
 }
 
+/** 掉落风险试算建议的「并入相邻轮廓」：删除该内片，镂空并入其父轮廓（包含树自动重建） */
+export function mergeContourIntoParent(p: Project, contourId: string): boolean {
+  for (const shape of p.shapes) {
+    const i = shape.contours.findIndex((c) => c.id === contourId)
+    if (i < 0) continue
+    const c = shape.contours[i]
+    if (!c.closed) return false
+    // 先确保包含树是最新的（areaThreshold 变化不改变树，但几何可能已变）
+    recomputeProject(p, true)
+    const comp = computedCache[shape.id]
+    const parentId = comp?.tree.nodeById.get(contourId)?.parentId ?? null
+    if (!parentId) return false
+    shape.contours.splice(i, 1)
+    recomputeProject(p, true)
+    touch(p)
+    return true
+  }
+  return false
+}
+
+/** 按风险建议把缺口参数直接应用为全局规则 */
+export function applyRiskSuggestion(p: Project, widthMm: number): void {
+  p.settings.bridgeWidthMm = Math.round(Math.max(0.1, Math.min(2, widthMm)) * 100) / 100
+  recomputeProject(p, true)
+  touch(p)
+}
+
 /** 纹样对称生成：镜像 / 旋转 / 四方连续 */
 export function applySymmetry(p: Project, shapeId: string, op: 'mirror_x' | 'mirror_y' | 'rotate_90' | 'rotate_180' | 'four_way'): void {
   const shape = p.shapes.find((s) => s.id === shapeId)
@@ -485,6 +512,8 @@ export const store = {
   removeContour,
   placeManualBridge,
   clearManualBridges,
+  mergeContourIntoParent,
+  applyRiskSuggestion,
   applySymmetry,
   upsertMaterial,
   deleteMaterial,

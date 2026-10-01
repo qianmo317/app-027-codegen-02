@@ -9,6 +9,15 @@ import type { ComputedShape } from '@/logic/pipeline'
 import { makeContour } from '@/logic/cleanup'
 import { dist, uid } from '@/logic/geometry'
 import { arcToCubics, sampleCubicInto } from '@/logic/svg'
+import {
+  assessProject,
+  plansForHypothetical,
+  RISK_COLORS,
+  type ContourRisk,
+  type RiskInput,
+  type RiskLevel,
+  type RiskReport,
+} from '@/logic/dropRisk'
 
 type Mode = 'outline' | 'toolpath' | 'bridge'
 type Tool = 'select' | 'pan' | 'rect' | 'circle' | 'polygon' | 'bridge'
@@ -31,6 +40,7 @@ const error = ref('')
 const showProblems = ref(true)
 const showRules = ref(true)
 const showContour = ref(true)
+const showRisk = ref(true)
 
 watch(
   project,
@@ -42,6 +52,13 @@ watch(
   },
   { immediate: true },
 )
+
+// 切换项目时清掉上一个项目的对照快照与筛选
+watch(projectId, () => {
+  snapshot.value = null
+  riskFilter.value = 'all'
+  selectedContourId.value = null
+})
 
 const shapes = computed(() => project.value?.shapes ?? [])
 const selectedShape = computed(() => shapes.value.find((s) => s.id === selectedShapeId.value) ?? null)
@@ -324,6 +341,11 @@ const selMetrics = computed(() => {
   return m ?? null
 })
 
+const selRisk = computed<ContourRisk | null>(() => {
+  if (!selectedContourId.value) return null
+  return riskReport.value?.items.find((i) => i.contourId === selectedContourId.value) ?? null
+})
+
 const computedMap = computed(() => {
   const m = new Map<string, ComputedShape>()
   for (const s of shapes.value) {
@@ -332,6 +354,127 @@ const computedMap = computed(() => {
   }
   return m
 })
+
+// ---------------- 掉落风险试算 ----------------
+
+const riskInput = computed<RiskInput | null>(() => {
+  const p = project.value
+  if (!p || !settings.value) return null
+  return {
+    areaThresholdMm2: p.settings.areaThresholdMm2,
+    bridgeWidthMm: p.settings.bridgeWidthMm,
+    bridgeEveryMm: p.settings.bridgeEveryMm,
+    bridgeRule: p.settings.bridgeRule,
+    material: store.materialOf(p),
+  }
+})
+
+/** 当前版试算：参数/几何/层级一变，computed 依赖（shapes、settings）触发立刻重算 */
+const riskReport = computed<RiskReport | null>(() => {
+  const p = project.value
+  const input = riskInput.value
+  if (!p || !input) return null
+  // 所有改动入口（设置/绘图/手工连刀点/层级/材料）都已同步调用 recomputeProject
+  return assessProject(shapes.value, computedMap.value, input)
+})
+
+/** 对照版快照（冻结当时的参数 + 几何/层级结构指纹 + 试算结论） */
+type RiskSnapshot = {
+  label: string
+  at: number
+  widthMm: number
+  thresholdMm2: number
+  rule: string
+  report: RiskReport
+}
+const snapshot = ref<RiskSnapshot | null>(null)
+const riskFilter = ref<'all' | RiskLevel>('all')
+
+function takeSnapshot(): void {
+  const p = project.value
+  const r = riskReport.value
+  const s = settings.value
+  if (!p || !r || !s) return
+  snapshot.value = {
+    label: `宽 ${s.bridgeWidthMm}mm · 阈值 ${s.areaThresholdMm2}mm²`,
+    at: Date.now(),
+    widthMm: s.bridgeWidthMm,
+    thresholdMm2: s.areaThresholdMm2,
+    rule: s.bridgeRule,
+    report: JSON.parse(JSON.stringify(r)) as RiskReport,
+  }
+}
+
+function clearSnapshot(): void {
+  snapshot.value = null
+}
+
+/** 对照版结论在「假设快照参数 + 当前几何」下重算：宽度/阈值改了可立刻看到差异 */
+const compareReport = computed<RiskReport | null>(() => {
+  const p = project.value
+  const snap = snapshot.value
+  if (!p || !snap) return null
+  const input: RiskInput = {
+    areaThresholdMm2: snap.thresholdMm2,
+    bridgeWidthMm: snap.widthMm,
+    bridgeEveryMm: p.settings.bridgeEveryMm,
+    bridgeRule: snap.rule as RiskInput['bridgeRule'],
+    material: store.materialOf(p),
+  }
+  const plans = plansForHypothetical(shapes.value, input)
+  return assessProject(shapes.value, computedMap.value, input, plans)
+})
+
+const riskRows = computed(() => {
+  const r = riskReport.value
+  if (!r) return []
+  const rows = riskFilter.value === 'all' ? r.items : r.items.filter((i) => i.level.level === riskFilter.value)
+  return rows
+})
+
+const riskCounts = computed(() => {
+  const items = riskReport.value?.items ?? []
+  return {
+    low: items.filter((i) => i.level.level === 'low').length,
+    medium: items.filter((i) => i.level.level === 'medium').length,
+    high: items.filter((i) => i.level.level === 'high').length,
+    critical: items.filter((i) => i.level.level === 'critical').length,
+  }
+})
+
+/** 同一片在两版之间的评分差（正 = 对照版更危险） */
+function scoreDelta(item: ContourRisk): number | null {
+  const other = compareReport.value?.items.find((x) => x.contourId === item.contourId && x.shapeId === item.shapeId)
+  if (!other) return null
+  return other.level.score - item.level.score
+}
+
+function locateRisk(item: ContourRisk): void {
+  selectedShapeId.value = item.shapeId
+  selectedContourId.value = item.contourId
+  mode.value = 'outline'
+  canvas.value?.focusContour(item.contourId)
+}
+
+function applySuggestedWidth(item: ContourRisk): void {
+  const p = project.value
+  if (!p) return
+  // 取下限四舍五入到 0.05
+  const w = Math.round((item.suggestion.widthLo / 0.05)) * 0.05
+  store.applyRiskSuggestion(p, w)
+}
+
+function mergeRiskPiece(item: ContourRisk): void {
+  const p = project.value
+  if (!p) return
+  if (!confirm(`把这片（${item.areaMm2.toFixed(2)}mm²）并入相邻轮廓？该镂空将从纹样中消失。`)) return
+  const ok = store.mergeContourIntoParent(p, item.contourId)
+  if (!ok) error.value = '该片没有可并入的相邻父轮廓（外轮廓不能并入）'
+  else {
+    error.value = ''
+    selectedContourId.value = null
+  }
+}
 </script>
 
 <template>
@@ -427,6 +570,7 @@ const computedMap = computed(() => {
         :show-travel="mode === 'toolpath'"
         :magnify="true"
         :selected-contour-id="selectedContourId"
+        :risk-items="riskReport?.items ?? null"
         :status-text="mode === 'bridge' ? '缺口已放大 8 倍' : ''"
         @select-contour="onSelectContour"
         @create-rect="onRect"
@@ -437,7 +581,14 @@ const computedMap = computed(() => {
       />
       <div class="panel-foot">
         <div class="legend">
-          <span v-if="mode === 'outline'"><i style="background: #cfd9e4"></i>轮廓</span>
+          <template v-if="mode !== 'toolpath'">
+            <span><i :style="{ background: RISK_COLORS.low }"></i>低危</span>
+            <span><i :style="{ background: RISK_COLORS.medium }"></i>中危</span>
+            <span><i :style="{ background: RISK_COLORS.high }"></i>高风险</span>
+            <span><i :style="{ background: RISK_COLORS.critical }"></i>危险</span>
+            <span style="color: var(--text-mute)">｜</span>
+          </template>
+          <span v-if="mode === 'outline'"><i style="background: #cfd9e4"></i>无风险轮廓</span>
           <span><i style="background: #ffc857"></i>未闭合</span>
           <span><i style="background: #ff6b6b"></i>自交</span>
           <span><i style="background: #b48cff"></i>重复路径</span>
@@ -463,6 +614,91 @@ const computedMap = computed(() => {
           <div class="stat"><div class="k">嵌套层数</div><div class="v">{{ totalStats.maxDepth }}</div></div>
           <div class="stat"><div class="k">几何偏差</div><div class="v">{{ totalStats.dev.toFixed(3) }}<small>mm</small></div></div>
           <div class="stat"><div class="k">计算耗时</div><div class="v">{{ totalStats.ms.toFixed(1) }}<small>ms</small></div></div>
+        </div>
+
+        <div class="section">
+          <div class="section-title" @click="showRisk = !showRisk">
+            掉落风险试算
+            <span class="tag" :class="riskReport && riskReport.dropCount ? 'err' : 'ok'">{{ riskReport?.dropCount ?? 0 }} 片会掉</span>
+            <span class="spacer"></span>
+            <button class="tiny" @click.stop="takeSnapshot">存为对照版</button>
+          </div>
+          <div v-show="showRisk">
+            <div v-if="!riskReport || riskReport.items.length === 0" class="empty">还没有闭合轮廓可评估，先导入纹样或绘制图形。</div>
+            <template v-else>
+              <!-- 总体结论 -->
+              <div class="risk-summary" :class="riskReport.criticalCount ? 'crit' : riskReport.highCount ? 'high' : 'ok'">
+                <div class="rs-head">
+                  <strong>总体结论</strong>
+                  <span class="tag" :class="riskReport.dropCount ? 'err' : 'ok'">会掉 {{ riskReport.dropCount }} 片</span>
+                </div>
+                <div class="rs-text">{{ riskReport.summary }}</div>
+                <div class="rs-levels">
+                  <span class="rl-chip" :class="{ active: riskFilter === 'critical' }" @click="riskFilter = riskFilter === 'critical' ? 'all' : 'critical'">
+                    <i :style="{ background: RISK_COLORS.critical }"></i>危险 {{ riskCounts.critical }}
+                  </span>
+                  <span class="rl-chip" :class="{ active: riskFilter === 'high' }" @click="riskFilter = riskFilter === 'high' ? 'all' : 'high'">
+                    <i :style="{ background: RISK_COLORS.high }"></i>高 {{ riskCounts.high }}
+                  </span>
+                  <span class="rl-chip" :class="{ active: riskFilter === 'medium' }" @click="riskFilter = riskFilter === 'medium' ? 'all' : 'medium'">
+                    <i :style="{ background: RISK_COLORS.medium }"></i>中 {{ riskCounts.medium }}
+                  </span>
+                  <span class="rl-chip" :class="{ active: riskFilter === 'low' }" @click="riskFilter = riskFilter === 'low' ? 'all' : 'low'">
+                    <i :style="{ background: RISK_COLORS.low }"></i>低 {{ riskCounts.low }}
+                  </span>
+                </div>
+              </div>
+
+              <!-- 两版对照 -->
+              <div v-if="snapshot" class="cmp-bar">
+                <div class="cmp-row">
+                  <span class="cmp-cell cur">
+                    当前<br /><span class="mono">宽 {{ settings?.bridgeWidthMm }}mm · 阈 {{ settings?.areaThresholdMm2 }}mm²</span><br />
+                    会掉 <b :class="riskReport.dropCount ? 'err-text' : 'ok-text'">{{ riskReport.dropCount }}</b> 片
+                  </span>
+                  <span class="cmp-arrow">⇄</span>
+                  <span class="cmp-cell snap">
+                    对照版<br /><span class="mono">{{ snapshot.label }}</span><br />
+                    会掉 <b :class="compareReport && compareReport.dropCount ? 'err-text' : 'ok-text'">{{ compareReport?.dropCount ?? '—' }}</b> 片
+                  </span>
+                </div>
+                <div class="cmp-note" v-if="compareReport">
+                  改参数后两版按当前几何即时重算；最危险片评分 {{ riskReport.worst?.level.score ?? '—' }} → {{ compareReport.worst?.level.score ?? '—' }}
+                  <button class="tiny" @click="clearSnapshot">清除对照</button>
+                </div>
+              </div>
+
+              <!-- 逐片列表 -->
+              <div class="list risk-list">
+                <div
+                  v-for="item in riskRows"
+                  :key="`${item.shapeId}-${item.contourId}`"
+                  class="list-item risk-item"
+                  :class="{ active: item.contourId === selectedContourId }"
+                  @click="locateRisk(item)"
+                >
+                  <span class="risk-bar" :style="{ background: item.level.color }"></span>
+                  <span class="grow">
+                    <span class="ri-top">
+                      <span class="tag" :style="{ color: item.level.color, borderColor: item.level.color + '66' }">{{ item.level.label }}</span>
+                      <span class="ri-name">{{ item.shapeName }}</span>
+                    </span>
+                    <span class="ri-meta mono">
+                      {{ item.areaMm2.toFixed(2) }}mm² · 细长{{ item.slenderness.toFixed(1) }} · L{{ item.depth }} ·
+                      缺口 {{ item.gapCount }}×{{ item.appliedWidthMm.toFixed(2) }}mm
+                    </span>
+                    <span class="ri-sug">{{ item.suggestion.strategyText }}：{{ item.suggestion.widthLo }}~{{ item.suggestion.widthHi }}mm ×{{ item.suggestion.count }}</span>
+                  </span>
+                  <span class="ri-score">
+                    <b :style="{ color: item.level.color }">{{ item.level.score }}</b>
+                    <small v-if="scoreDelta(item) !== null" :class="(scoreDelta(item) as number) > 0 ? 'err-text' : (scoreDelta(item) as number) < 0 ? 'ok-text' : ''">
+                      {{ (scoreDelta(item) as number) > 0 ? '+' : '' }}{{ scoreDelta(item) }}
+                    </small>
+                  </span>
+                </div>
+              </div>
+            </template>
+          </div>
         </div>
 
         <div class="section">
@@ -509,6 +745,30 @@ const computedMap = computed(() => {
                   #{{ i + 1 }} 锚点 ({{ b.at.x.toFixed(2) }}, {{ b.at.y.toFixed(2) }})｜宽 {{ b.widthMm.toFixed(3) }}mm
                 </div>
               </div>
+              <template v-if="selRisk">
+                <div class="risk-detail" :class="`lvl-${selRisk.level.level}`">
+                  <div class="rd-head">
+                    <span class="tag" :style="{ color: selRisk.level.color, borderColor: selRisk.level.color + '66' }">{{ selRisk.level.label }}风险 · {{ selRisk.level.score }}/100</span>
+                    <span class="hint">{{ selRisk.level.verdict }}</span>
+                  </div>
+                  <div class="rd-factors">
+                    <div v-for="f in selRisk.factors" :key="f.key" class="rd-factor">
+                      <span class="rd-flabel">{{ f.label }}</span>
+                      <span class="rd-bar"><i :style="{ width: Math.min(100, Math.abs(f.points) * 3) + '%', background: f.dir === 'up' ? 'var(--err)' : 'var(--ok)' }"></i></span>
+                      <span class="rd-fval mono">{{ f.points > 0 ? '+' : '' }}{{ f.points }}</span>
+                    </div>
+                  </div>
+                  <div class="hint" style="margin: 5px 0 3px">{{ selRisk.suggestion.reason }}</div>
+                  <div class="rd-suggest mono">
+                    建议缺口 {{ selRisk.suggestion.widthLo }}~{{ selRisk.suggestion.widthHi }}mm × {{ selRisk.suggestion.count }} 个
+                    <span v-if="selRisk.suggestion.mergeParentId">｜可并入轮廓 {{ selRisk.suggestion.mergeParentId.slice(-4) }}</span>
+                  </div>
+                  <div class="btn-row" style="margin-top: 6px">
+                    <button class="tiny" @click="applySuggestedWidth(selRisk)">应用建议宽度（全局）</button>
+                    <button class="tiny danger" :disabled="!selRisk.suggestion.mergeParentId" @click="mergeRiskPiece(selRisk)">并入相邻轮廓</button>
+                  </div>
+                </div>
+              </template>
             </template>
           </div>
         </div>
@@ -620,5 +880,247 @@ const computedMap = computed(() => {
   font-size: 11px;
   color: var(--text-mute);
   line-height: 1.7;
+}
+
+/* ---------- 掉落风险试算 ---------- */
+.risk-summary {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 9px;
+  margin-bottom: 8px;
+  background: var(--panel-2);
+}
+
+.risk-summary.ok {
+  border-color: rgba(71, 192, 122, 0.4);
+}
+.risk-summary.high {
+  border-color: rgba(255, 143, 60, 0.5);
+}
+.risk-summary.crit {
+  border-color: rgba(255, 77, 77, 0.55);
+  background: rgba(255, 77, 77, 0.07);
+}
+
+.rs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  font-size: 12px;
+}
+
+.rs-text {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.55;
+}
+
+.rs-levels {
+  display: flex;
+  gap: 5px;
+  margin-top: 7px;
+  flex-wrap: wrap;
+}
+
+.rl-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  padding: 1px 7px;
+  cursor: pointer;
+  background: var(--bg-grid);
+}
+
+.rl-chip.active {
+  border-color: var(--accent);
+  color: var(--accent-2);
+}
+
+.rl-chip i {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+
+.cmp-bar {
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  padding: 7px 8px;
+  margin-bottom: 8px;
+  background: var(--bg-grid);
+}
+
+.cmp-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.cmp-cell {
+  flex: 1;
+  border-radius: 5px;
+  padding: 5px 7px;
+  line-height: 1.5;
+  border: 1px solid var(--line-soft);
+}
+
+.cmp-cell.cur {
+  background: rgba(255, 143, 60, 0.08);
+  border-color: rgba(255, 143, 60, 0.35);
+}
+
+.cmp-cell.snap {
+  background: rgba(90, 169, 255, 0.07);
+  border-color: rgba(90, 169, 255, 0.35);
+}
+
+.cmp-arrow {
+  align-self: center;
+  color: var(--text-mute);
+}
+
+.cmp-note {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: var(--text-mute);
+}
+
+.err-text {
+  color: var(--err);
+}
+.ok-text {
+  color: var(--ok);
+}
+
+.risk-list {
+  max-height: 290px;
+  overflow: auto;
+}
+
+.risk-item {
+  padding: 5px 7px 5px 0;
+  gap: 0;
+}
+
+.risk-bar {
+  width: 4px;
+  align-self: stretch;
+  border-radius: 2px 0 0 2px;
+  margin-right: 7px;
+  flex: 0 0 4px;
+}
+
+.ri-top {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ri-name {
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ri-meta {
+  display: block;
+  font-size: 10.5px;
+  color: var(--text-mute);
+  margin-top: 1px;
+}
+
+.ri-sug {
+  display: block;
+  font-size: 10.5px;
+  color: var(--text-dim);
+  margin-top: 1px;
+}
+
+.ri-score {
+  margin-left: 6px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  line-height: 1.1;
+}
+
+.ri-score b {
+  font-family: var(--mono);
+  font-size: 15px;
+}
+
+.ri-score small {
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.risk-detail {
+  margin-top: 7px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 7px 8px;
+  background: var(--panel-2);
+}
+
+.rd-head {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 5px;
+}
+
+.rd-factors {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rd-factor {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+}
+
+.rd-flabel {
+  flex: 0 0 56px;
+  color: var(--text-mute);
+}
+
+.rd-bar {
+  flex: 1 1 auto;
+  height: 5px;
+  background: var(--bg-grid);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.rd-bar i {
+  display: block;
+  height: 100%;
+  border-radius: 3px;
+}
+
+.rd-fval {
+  flex: 0 0 30px;
+  text-align: right;
+  color: var(--text-dim);
+}
+
+.rd-suggest {
+  font-size: 11px;
+  color: var(--accent-2);
 }
 </style>
