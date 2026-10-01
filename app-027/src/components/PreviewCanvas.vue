@@ -7,8 +7,9 @@ import type { CutStep } from '@/logic/order'
 import { closestOnPolyline, boundsOf, mergeBounds } from '@/logic/geometry'
 import type { SheetPlacement } from '@/logic/exporters'
 import { placePoint } from '@/logic/exporters'
+import { RISK_GRADE_COLOR } from '@/logic/risk'
 
-type Mode = 'outline' | 'toolpath' | 'bridge'
+type Mode = 'outline' | 'toolpath' | 'bridge' | 'risk'
 type Tool = 'select' | 'rect' | 'circle' | 'polygon' | 'bridge' | 'pan'
 
 const props = withDefaults(
@@ -311,17 +312,41 @@ function pointsToD(pts: Pt[], closed: boolean): string {
 const outlineContours = computed<DrawContour[]>(() => {
   const out: DrawContour[] = []
   for (const s of props.shapes) {
+    const comp = props.computed.get(s.id)
     for (const c of s.contours) {
       const bad = c.warnings.find((w) => w === 'self_intersect' || w === 'not_closed' || w === 'duplicate')
+      const risk = comp?.byId.get(c.id)?.risk ?? null
+      const riskColor = risk ? RISK_GRADE_COLOR[risk.grade] : null
       out.push({
         id: c.id,
         shapeId: s.id,
         d: pointsToD(c.points, c.closed),
         contour: c,
-        color: bad ? WARNING_COLOR[bad] : props.mode === 'bridge' ? '#4a5768' : '#cfd9e4',
+        color: bad
+          ? WARNING_COLOR[bad]
+          : props.mode === 'risk'
+            ? riskColor ?? '#4a5768'
+            : props.mode === 'bridge'
+              ? '#4a5768'
+              : '#cfd9e4',
         dash: bad === 'duplicate' ? '5 4' : bad === 'not_closed' ? '7 4' : '',
-        width: c.id === props.selectedContourId ? 2.4 : 1.2,
+        width: c.id === props.selectedContourId ? 2.4 : props.mode === 'risk' && risk && risk.grade !== 'safe' ? 2 : 1.2,
       })
+    }
+  }
+  return out
+})
+
+/** 风险模式下给闭合轮廓填充半透明危险底色（安全档不填充，避免整图发绿） */
+const riskFills = computed(() => {
+  if (props.mode !== 'risk') return []
+  const out: Array<{ id: string; d: string; color: string; grade: string }> = []
+  for (const s of props.shapes) {
+    const comp = props.computed.get(s.id)
+    for (const c of s.contours) {
+      const risk = comp?.byId.get(c.id)?.risk ?? null
+      if (!risk || risk.grade === 'safe' || !c.closed) continue
+      out.push({ id: c.id, d: pointsToD(c.points, true), color: RISK_GRADE_COLOR[risk.grade], grade: risk.grade })
     }
   }
   return out
@@ -521,8 +546,13 @@ function focusContour(id: string): void {
           vector-effect="non-scaling-stroke"
         />
 
+        <!-- 风险档底色 -->
+        <g v-if="mode === 'risk'" :fill-opacity="0.28" stroke="none">
+          <path v-for="f in riskFills" :key="`rf${f.id}`" :d="f.d" :fill="f.color" />
+        </g>
+
         <!-- 成品轮廓 -->
-        <g v-if="mode === 'outline' || mode === 'bridge' || !job" fill="none" stroke-linecap="round" stroke-linejoin="round">
+        <g v-if="mode === 'outline' || mode === 'bridge' || mode === 'risk' || !job" fill="none" stroke-linecap="round" stroke-linejoin="round">
           <path
             v-for="c in outlineContours"
             :key="c.id"

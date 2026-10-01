@@ -4,6 +4,7 @@ import { buildContainmentTree, type NestingResult } from './nesting'
 import { orderCut, type OrderResult } from './order'
 import { offsetPolygon } from './offset'
 import { boundsOf, mergeBounds, polygonArea, polylineLength, type Bounds } from './geometry'
+import { evaluateContourRisk, type ContourRisk } from './risk'
 
 export type ComputedContour = {
   id: string
@@ -12,6 +13,8 @@ export type ComputedContour = {
   bridgeMetrics: BridgeMetrics
   /** 连刀点锚点（预览 / 放大视图） */
   anchors: BridgeAnchor[]
+  /** 掉落风险试算（仅闭合轮廓有值） */
+  risk: ContourRisk | null
   offsetOk: boolean
   offsetMessage: string
 }
@@ -195,7 +198,27 @@ export function computeShape(
         )
       : []
 
-    byId.set(c.id, { id: c.id, runs, bridgeMetrics: plan.metrics, anchors, offsetOk, offsetMessage })
+    // 3.5) 掉落风险试算（面积 / 细长 / 层深 / 缺口保持力 / 分布偏置）
+    let risk: ContourRisk | null = null
+    if (c.closed) {
+      const parentNode = tree.nodeById.get(c.id)?.parentId ?? null
+      const parentContour = parentNode ? shape.contours.find((x) => x.id === parentNode) ?? null : null
+      risk = evaluateContourRisk({
+        id: c.id,
+        points: c.points,
+        area: c.area,
+        length: L,
+        depth,
+        layer: shape.layer,
+        gaps: plan.gaps,
+        appliedWidthMm: plan.metrics.appliedWidthMm,
+        areaThresholdMm2: settings.areaThresholdMm2,
+        parent: parentContour ? { id: parentContour.id, areaMm2: parentContour.area } : null,
+        degraded: plan.metrics.degraded,
+      })
+    }
+
+    byId.set(c.id, { id: c.id, runs, bridgeMetrics: plan.metrics, anchors, risk, offsetOk, offsetMessage })
     runsOf.set(c.id, runs)
     if (warnings.length > 0) warningUpdates.set(c.id, warnings)
   }

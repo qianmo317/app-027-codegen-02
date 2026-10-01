@@ -7,6 +7,8 @@ import { computeShape } from './pipeline'
 import { buildJob } from './job'
 import { buildA4Sheet, computePlacement, exportGcode, exportPlt, type ExportMeta } from './exporters'
 import { polygonArea, polylineLength } from './geometry'
+import { aggregateRisk, evaluateContourRisk, type RiskInput } from './risk'
+import type { BridgeGap } from './bridges'
 
 export type CheckResult = {
   id: string
@@ -385,6 +387,127 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
     checks.push(ok('export-plt', '导出 PLT 用例', false, '没有可用的纹样'))
   }
 
+  // ---------- 10. 掉落风险试算 ----------
+  const gap = (s: number, w = 0.5): BridgeGap => ({ s, widthMm: w, atIndex: 0 })
+  const riskInput = (
+    id: string,
+    pts: Pt[],
+    opts: { depth: number; layer?: number; gaps: BridgeGap[]; appliedWidth?: number; parent?: { id: string; areaMm2: number }; degraded?: boolean; threshold?: number },
+  ): RiskInput => ({
+    id,
+    points: pts,
+    area: polygonArea(pts),
+    length: polylineLength(pts, true),
+    depth: opts.depth,
+    layer: opts.layer ?? 0,
+    gaps: opts.gaps,
+    appliedWidthMm: opts.appliedWidth ?? 0.5,
+    areaThresholdMm2: opts.threshold ?? settings.areaThresholdMm2,
+    parent: opts.parent ?? null,
+    degraded: opts.degraded ?? false,
+  })
+
+  // 10a. 深层极小孤岛、无缺口 → 危险档
+  const tiny = ellipsePts(60, 60, 0.9, 0.9, 18)
+  const tinyRisk = evaluateContourRisk(
+    riskInput('risk_tiny', tiny, { depth: 3, gaps: [], parent: { id: 'outer', areaMm2: 400 } }),
+  )
+  // 10b. 同一片、两个均匀缺口、宽度足够 → 明显降档
+  const tinyBridged = evaluateContourRisk(
+    riskInput('risk_tiny_b', tiny, {
+      depth: 3,
+      gaps: [gap(polylineLength(tiny, true) * 0.25, 0.7), gap(polylineLength(tiny, true) * 0.75, 0.7)],
+      appliedWidth: 0.7,
+      parent: { id: 'outer', areaMm2: 400 },
+    }),
+  )
+  const tinyGap = tinyRisk.score - tinyBridged.score
+  checks.push(
+    ok(
+      'risk-tiny',
+      '掉落风险：深层极小孤岛无连刀点判为危险；补上均匀缺口后显著降档',
+      tinyRisk.grade === 'critical' && tinyGap >= 12,
+      `半径 0.9mm 孤岛（面积 ${polygonArea(tiny).toFixed(2)}mm²，depth3）：无缺口 ${tinyRisk.score} 分（${tinyRisk.grade}）→ 2 个 0.7mm 缺口 ${tinyBridged.score} 分（${tinyBridged.grade}），下降 ${tinyGap} 分`,
+    ),
+  )
+
+  // 10c. 细长条 vs 等面积近圆片：细长条风险明显更高
+  const strip = rectPts(0, 0, 14, 0.5)
+  const blob = ellipsePts(0, 0, 1.6, 1.4, 24) // ≈7mm²，与细条接近
+  const stripRisk = evaluateContourRisk(
+    riskInput('risk_strip', strip, { depth: 3, gaps: [gap(3), gap(11)], parent: { id: 'o', areaMm2: 400 } }),
+  )
+  const blobRisk = evaluateContourRisk(
+    riskInput('risk_blob', blob, { depth: 3, gaps: [gap(polylineLength(blob, true) * 0.25), gap(polylineLength(blob, true) * 0.75)], parent: { id: 'o', areaMm2: 400 } }),
+  )
+  checks.push(
+    ok(
+      'risk-slender',
+      '掉落风险：同面积量级下细长条比近圆片更危险（长宽比因子生效）',
+      stripRisk.factors.slenderness > 5 && stripRisk.score > blobRisk.score + 8,
+      `14×0.5mm 细条（长宽比 ${stripRisk.factors.slenderness.toFixed(1)}）${stripRisk.score} 分 vs 近圆片（${blobRisk.factors.slenderness.toFixed(1)}）${blobRisk.score} 分`,
+    ),
+  )
+
+  // 10d. 过短轮廓加宽不可行且有父轮廓 → 建议并入相邻轮廓
+  const micro = rectPts(0, 0, 1.0, 1.0)
+  const microRisk = evaluateContourRisk(
+    riskInput('risk_micro', micro, { depth: 3, gaps: [gap(0.2, 0.2)], appliedWidth: 0.2, degraded: true, parent: { id: 'o', areaMm2: 400 } }),
+  )
+  checks.push(
+    ok(
+      'risk-merge',
+      '掉落风险：周长过短无处加宽时建议「并入相邻轮廓」而非硬加宽',
+      microRisk.grade !== 'safe' && microRisk.suggestion.kind === 'merge' && microRisk.suggestion.mergeTargetId === 'o',
+      `1×1mm 小岛 ${microRisk.score} 分（${microRisk.grade}）：${microRisk.suggestion.kind}｜${microRisk.suggestion.reason.slice(0, 60)}…`,
+    ),
+  )
+
+  // 10e. 汇总函数：预计掉片数与「最危险一片」
+  const summary = aggregateRisk([
+    { shapeId: 's', area: 10000, risk: evaluateContourRisk(riskInput('big', rectPts(0, 0, 100, 100), { depth: 1, gaps: [gap(50), gap(150), gap(250), gap(350)] })) },
+    { shapeId: 's', area: polygonArea(tiny), risk: tinyRisk },
+    { shapeId: 's', area: polygonArea(strip), risk: stripRisk },
+  ])
+  checks.push(
+    ok(
+      'risk-summary',
+      '掉落风险：总体结论给出预计掉片数与最危险轮廓（最外层大块不计入掉片）',
+      summary.total === 3 &&
+        summary.expectedDrops >= 1 &&
+        summary.worst?.id === 'risk_tiny' &&
+        summary.critical >= 1,
+      `共 ${summary.total} 片｜预计掉 ${summary.expectedDrops} 片（≈${summary.expectedDropsRaw}）｜危险 ${summary.critical} / 高危 ${summary.high}｜最危险 = ${summary.worst?.id}（${summary.worst?.score} 分）`,
+    ),
+  )
+
+  // 10f. 与管线联动：改缺口宽度后风险结果随之变化（缓存签名失效）
+  //      用带长边的方形小岛（采样椭圆的边太短，缺口会被几何削窄，测不出宽度差异）
+  const probePts = rectPts(29, 29, 2.2, 1.4)
+  const probeShape: Shape = {
+    id: 'risk_probe',
+    name: '风险用例',
+    layer: 0,
+    contours: [
+      { id: 'rp_outer', points: rectPts(0, 0, 60, 60), closed: true, area: 3600, length: 240, holes: [], bridges: [], warnings: [] },
+      { id: 'rp_island', points: probePts, closed: true, area: 2.2 * 1.4, length: 2 * (2.2 + 1.4), holes: [], bridges: [], warnings: [] },
+    ],
+  }
+  const compNarrow = computeShape(probeShape, { ...settings, bridgeWidthMm: 0.3 }, mat)
+  const compWide = computeShape(probeShape, { ...settings, bridgeWidthMm: 1.0 }, mat)
+  const islandNarrow = compNarrow.byId.get('rp_island')?.risk
+  const islandWide = compWide.byId.get('rp_island')?.risk
+  const appliedN = compNarrow.byId.get('rp_island')?.bridgeMetrics.appliedWidthMm
+  const appliedW = compWide.byId.get('rp_island')?.bridgeMetrics.appliedWidthMm
+  checks.push(
+    ok(
+      'risk-reactive',
+      '掉落风险：缺口宽度/面积阈值/层级变化后立即重算（管线签名失效、风险分随宽度下降）',
+      !!islandNarrow && !!islandWide && (appliedW ?? 0) > (appliedN ?? 0) && islandWide.score < islandNarrow.score,
+      `2.2×1.4mm 小岛：缺口设定 0.3mm（生效 ${appliedN}mm）→ ${islandNarrow?.score} 分；设定 1.0mm（生效 ${appliedW}mm）→ ${islandWide?.score} 分`,
+    ),
+  )
+
   // ---------- 7. 性能 ----------
   const bigPts = wavyCircle(80, 80, 62, 5000, 2.5, 11)
   const rawBig: Array<{ points: Pt[]; closed: boolean }> = [{ points: bigPts, closed: true }]
@@ -458,13 +581,28 @@ export async function runSelfTest(settings: CutSettings = DEFAULT_CUT_SETTINGS, 
 }
 
 /** 矩形轮廓 */
-function rectContour(id: string, x: number, y: number, w: number, h: number): Shape['contours'][number] {
-  const pts: Pt[] = [
+function rectPts(x: number, y: number, w: number, h: number): Pt[] {
+  return [
     { x, y },
     { x: x + w, y },
     { x: x + w, y: y + h },
     { x, y: y + h },
   ]
+}
+
+/** 椭圆折线（供风险试算测试构造近圆片） */
+function ellipsePts(cx: number, cy: number, rx: number, ry: number, n: number): Pt[] {
+  const pts: Pt[] = []
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2
+    pts.push({ x: Math.round((cx + rx * Math.cos(a)) * 1000) / 1000, y: Math.round((cy + ry * Math.sin(a)) * 1000) / 1000 })
+  }
+  return pts
+}
+
+/** 矩形轮廓（带 id，用于管线类用例） */
+function rectContour(id: string, x: number, y: number, w: number, h: number): Shape['contours'][number] {
+  const pts = rectPts(x, y, w, h)
   return { id, points: pts, closed: true, area: w * h, length: 2 * (w + h), holes: [], bridges: [], warnings: [] }
 }
 
